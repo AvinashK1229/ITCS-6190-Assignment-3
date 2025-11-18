@@ -29,7 +29,7 @@ This project demonstrates an end-to-end serverless data processing pipeline on A
 ## 1️⃣ Amazon S3 Bucket Structure 🪣
 
 ### Setup Steps:
-1. Created S3 bucket: `aws-orders-pipeline-bharath` in `us-east-1` region
+1. Created S3 bucket: `aws-orders-pipeline-avinash` in `us-east-1` region
 2. Established three-folder architecture:
    - **`raw/`**: Stores incoming raw CSV files (Orders.csv)
    - **`processed/`**: Contains Lambda-filtered data (filtered_Orders.csv)
