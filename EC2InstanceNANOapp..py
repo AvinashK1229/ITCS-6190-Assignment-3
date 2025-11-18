@@ -2,142 +2,107 @@ import boto3
 import time
 from flask import Flask
 
-# --- CONFIGURATION - REPLACE THESE VALUES ---
-AWS_REGION = "us-east-1"  # e.g., "us-west-2"
-ATHENA_DATABASE = "default"  # The name of your Athena database
-S3_OUTPUT_LOCATION = "s3://your-athena-results-bucket/" # Your Athena results bucket
-# -------------------------------------------
+AWS_REGION = "us-east-2"
+ATHENA_DATABASE = "orders_db"
+S3_OUTPUT_LOCATION = "s3://aws-orders-pipeline-avinash/enriched/"
+TABLE = "orders_pipeline_avinash"   # <- change if Glue created a different name
 
-# Initialize Flask app and Boto3 client
 app = Flask(__name__)
-athena_client = boto3.client('athena', region_name=AWS_REGION)
-s3_client = boto3.client('s3', region_name=AWS_REGION)
+athena = boto3.client('athena', region_name=AWS_REGION)
 
-# List of your queries with descriptive titles
-queries_to_run = [
+QUERIES = [
     {
         "title": "1. Total Sales by Customer",
-        "query": """
-            SELECT Customer, SUM(Amount) AS TotalAmountSpent
-            FROM "filtered_orders"
-            GROUP BY Customer
-            ORDER BY TotalAmountSpent DESC;
+        "sql": f"""
+            SELECT customer, SUM(CAST(amount AS DOUBLE)) AS total_spent
+            FROM "{TABLE}"
+            GROUP BY customer
+            ORDER BY total_spent DESC;
         """
     },
     {
-        "title": "2. Monthly Order Volume and Revenue",
-        "query": """
-            SELECT DATE_TRUNC('month', CAST(OrderDate AS DATE)) AS OrderMonth,
-            COUNT(OrderID) AS NumberOfOrders,
-            ROUND(SUM(Amount), 2) AS MonthlyRevenue
-            FROM "filtered_orders"
-            GROUP BY 1 ORDER BY OrderMonth;
+        "title": "2. Monthly Orders + Revenue",
+        "sql": f"""
+            SELECT DATE_TRUNC('month', CAST(orderdate AS DATE)) AS month,
+                   COUNT(*) AS orders,
+                   SUM(CAST(amount AS DOUBLE)) AS revenue
+            FROM "{TABLE}"
+            GROUP BY 1
+            ORDER BY 1;
         """
     },
     {
-        "title": "3. Order Status Dashboard",
-        "query": """
-            SELECT Status, COUNT(OrderID) AS OrderCount, ROUND(SUM(Amount), 2) AS TotalAmount
-            FROM "filtered_orders"
-            GROUP BY Status;
+        "title": "3. Orders by Status",
+        "sql": f"""
+            SELECT LOWER(status) AS status, COUNT(*) AS count
+            FROM "{TABLE}"
+            GROUP BY 1;
         """
     },
     {
-        "title": "4. Average Order Value (AOV) per Customer",
-        "query": """
-            SELECT Customer, ROUND(AVG(Amount), 2) AS AverageOrderValue
-            FROM "filtered_orders"
-            GROUP BY Customer
-            ORDER BY AverageOrderValue DESC;
+        "title": "4. Average Order Value per Customer",
+        "sql": f"""
+            SELECT customer, AVG(CAST(amount AS DOUBLE)) AS aov
+            FROM "{TABLE}"
+            GROUP BY customer
+            ORDER BY aov DESC;
         """
     },
     {
-        "title": "5. Top 10 Largest Orders in February 2025",
-        "query": """
-            SELECT OrderDate, OrderID, Customer, Amount
-            FROM "filtered_orders"
-            WHERE CAST(OrderDate AS DATE) BETWEEN DATE '2025-02-01' AND DATE '2025-02-28'
-            ORDER BY Amount DESC LIMIT 10;
+        "title": "5. Top 10 Orders Feb 2025",
+        "sql": f"""
+            SELECT orderdate, orderid, customer, CAST(amount AS DOUBLE) AS amount
+            FROM "{TABLE}"
+            WHERE CAST(orderdate AS DATE)
+                  BETWEEN DATE '2025-02-01' AND DATE '2025-02-28'
+            ORDER BY amount DESC
+            LIMIT 10;
         """
     }
 ]
 
-def run_athena_query(query):
-    """Starts an Athena query and waits for it to complete."""
-    try:
-        response = athena_client.start_query_execution(
-            QueryString=query,
-            QueryExecutionContext={'Database': ATHENA_DATABASE},
-            ResultConfiguration={'OutputLocation': S3_OUTPUT_LOCATION}
-        )
-        query_execution_id = response['QueryExecutionId']
+def run_query(query):
+    response = athena.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={'Database': ATHENA_DATABASE},
+        ResultConfiguration={'OutputLocation': S3_OUTPUT_LOCATION}
+    )
+    qid = response['QueryExecutionId']
 
-        # Poll for query completion
-        while True:
-            stats = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
-            status = stats['QueryExecution']['Status']['State']
-            if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
-                break
-            time.sleep(1) # Wait 1 second before checking again
-
+    while True:
+        result = athena.get_query_execution(QueryExecutionId=qid)
+        status = result['QueryExecution']['Status']['State']
+        if status in ['FAILED', 'CANCELLED']:
+            return None, f"Athena FAILED: {result['QueryExecution']['Status'].get('StateChangeReason', '')}"
         if status == 'SUCCEEDED':
-            s3_path = stats['QueryExecution']['ResultConfiguration']['OutputLocation']
-            bucket_name, key = s3_path.replace("s3://", "").split("/", 1)
+            break
+        time.sleep(1)
 
-            # Fetch results from S3
-            s3_response = s3_client.get_object(Bucket=bucket_name, Key=key)
-            lines = s3_response['Body'].read().decode('utf-8').splitlines()
-
-            # Parse CSV into a list of lists
-            header = [h.strip('"') for h in lines[0].split(',')]
-            results = [[val.strip('"') for val in line.split(',')] for line in lines[1:]]
-            return header, results
-        else:
-            error_message = stats['QueryExecution']['Status'].get('StateChangeReason', 'Unknown error')
-            return None, f"Query failed: {error_message}"
-    except Exception as e:
-        return None, f"An exception occurred: {str(e)}"
+    results = athena.get_query_results(QueryExecutionId=qid)
+    rows = results['ResultSet']['Rows']
+    header = [col['VarCharValue'] for col in rows[0]['Data']]
+    data = []
+    for row in rows[1:]:
+        data.append([cell.get('VarCharValue', '') for cell in row['Data']])
+    return header, data
 
 @app.route('/')
 def index():
-    """Main route to display the dashboard."""
-    html_content = "<html><head><title>Athena Orders Dashboard</title>"
-    html_content += """
-        <style>
-            body { font-family: sans-serif; margin: 2em; background-color: #f4f4f9; }
-            h1 { color: #333; }
-            h2 { color: #555; border-bottom: 2px solid #ddd; padding-bottom: 5px; }
-            table { border-collapse: collapse; width: 80%; margin-top: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-            th, td { border: 1px solid #ccc; padding: 10px; text-align: left; }
-            th { background-color: #007bff; color: white; }
-            tr:nth-child(even) { background-color: #f2f2f2; }
-        </style>
-    </head><body>"""
-    html_content += "<h1>📊 Athena Orders Dashboard</h1>"
+    html = "<h1>Athena Dashboard</h1>"
+    for q in QUERIES:
+        html += f"<h2>{q['title']}</h2>"
+        header, data = run_query(q['sql'])
+        if header is None:
+            html += f"<p style='color:red;'>Error: {data}</p>"
+            continue
 
-    for item in queries_to_run:
-        html_content += f"<h2>{item['title']}</h2>"
+        html += "<table border='1' cellpadding='5'>"
+        html += "<tr>" + "".join(f"<th>{h}</th>" for h in header) + "</tr>"
+        for row in data:
+            html += "<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>"
+        html += "</table><br>"
 
-        header, results = run_athena_query(item['query'])
+    return html
 
-        if header and results is not None:
-            html_content += "<table><thead><tr>"
-            for col in header:
-                html_content += f"<th>{col}</th>"
-            html_content += "</tr></thead><tbody>"
-            for row in results:
-                html_content += "<tr>"
-                for cell in row:
-                    html_content += f"<td>{cell}</td>"
-                html_content += "</tr>"
-            html_content += "</tbody></table>"
-        else: # Handle errors
-            html_content += f"<p style='color:red;'><strong>Error:</strong> {results}</p>"
-
-    html_content += "</body></html>"
-    return html_content
-
-if __name__ == '__main__':
-    # Run the app on all available network interfaces
-    app.run(host='0.0.0.0', port=5000)
-
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
